@@ -3,6 +3,7 @@ const _ = require('lodash')
 const fs = require('fs');
 const jsonFile = require('jsonfile')
 const es = require('@elastic/elasticsearch')
+const querystring = require('querystring')
 
 function _updateQueryStringParameter (uri, key, value) {
   var re = new RegExp('([?&])' + key + '=.*?(&|#|$)', 'i');
@@ -31,6 +32,39 @@ function adjustIndexName (indexName, entityType, config) {
   }
 }
 
+function decorateBackendUrl (entityType, url, req, config) {
+  if (config.elasticsearch.useRequestFilter && typeof config.entities[entityType] === 'object') {
+    const urlParts = url.split('?')
+    const { includeFields, excludeFields } = config.entities[entityType]
+
+    const filteredParams = Object.keys(req.query)
+      .filter(key => !config.elasticsearch.requestParamsBlacklist.includes(key))
+      .reduce((object, key) => {
+        object[key] = req.query[key]
+        return object
+      }, {})
+
+    let _source_include = includeFields || []
+    let _source_exclude = excludeFields || []
+
+    if (!config.elasticsearch.overwriteRequestSourceParams) {
+      const requestSourceInclude = req.query._source_include || []
+      const requestSourceExclude = req.query._source_exclude || []
+      _source_include = [...includeFields, ...requestSourceInclude]
+      _source_exclude = [...excludeFields, ...requestSourceExclude]
+    }
+
+    const urlParams = {
+      ...filteredParams,
+      _source_include,
+      _source_exclude
+    }
+    url = `${urlParts[0]}?${querystring.stringify(urlParams)}`
+  }
+
+  return url
+}
+
 function adjustBackendProxyUrl (req, indexName, entityType, config) {
   let url
   const queryString = require('query-string');
@@ -49,12 +83,17 @@ function adjustBackendProxyUrl (req, indexName, entityType, config) {
     delete parsedQuery.request
     delete parsedQuery.request_format
     delete parsedQuery.response_format
+    if (config.elasticsearch.cacheRequest) {
+      parsedQuery.request_cache = !!config.elasticsearch.cacheRequest
+    }
+
     url = config.elasticsearch.host + ':' + config.elasticsearch.port + '/' + adjustIndexName(indexName, entityType, config) + '/_search?' + queryString.stringify(parsedQuery)
   }
   if (!url.startsWith('http')) {
     url = config.elasticsearch.protocol + '://' + url
   }
-  return url
+
+  return decorateBackendUrl(entityType, url, req, config)
 }
 
 function adjustQuery (esQuery, entityType, config) {
@@ -73,6 +112,7 @@ function getHits (result) {
   }
 }
 
+let esClient = null
 function getClient (config) {
   let { host, port, protocol, apiVersion, requestTimeout } = config.elasticsearch
   const node = `${protocol}://${host}:${port}`
@@ -83,7 +123,11 @@ function getClient (config) {
     auth = { username: user, password }
   }
 
-  return new es.Client({ node, auth, apiVersion, requestTimeout })
+  if (!esClient) {
+    esClient = new es.Client({ node, auth, apiVersion, requestTimeout })
+  }
+
+  return esClient
 }
 
 function putAlias (db, originalName, aliasName, next) {
